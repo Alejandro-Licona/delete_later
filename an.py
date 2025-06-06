@@ -33,22 +33,51 @@ def calculate_nav(df: pd.DataFrame) -> pd.DataFrame:
     ZERO_NAV_CHANGE_GROUPS = [
         {'to_0x_proxy_wallet', 'from_0x_proxy_wallet'},
         {'aave_supply', 'debit'},
-        {'aave_withdraw', 'credit'},
     ]
-    # DECREASING_TX_TYPES = {'from_0x_settler_v1_9'}
     DECREASING_NAV_CHANGE_GROUPS = [{'debit'}]
     INCREASING_NAV_CHANGE_GROUPS = [{'credit'}]
+
+    BUNDLED_TXN_RULES = [
+        {
+            'types': {'aave_withdraw', 'credit'},
+            'operations': {
+                'aave_withdraw': 'add',
+                'credit': 'subtract'
+            }
+        }
+    ]
 
     # Get indices for all rule groups, ensuring precedence
     zero_impact_indices = set()
     increasing_indices = set()
     decreasing_indices = set()
+    bundled_indices = set()
+    bundled_nav_changes = {}
 
     grouped_by_hash = df_processed.groupby('hash')
-    for _, group in grouped_by_hash:
+    for hash_val, group in grouped_by_hash:
         tx_types = set(group['transaction_type'])
         
-        # Check for zero-impact groups first (highest precedence)
+        # Rule 0: Bundled Transactions (highest precedence)
+        is_bundled = False
+        for rule in BUNDLED_TXN_RULES:
+            if rule['types'].issubset(tx_types):
+                total_change = 0.0
+                for index, row in group.iterrows():
+                    op = rule['operations'].get(row['transaction_type'])
+                    if op == 'add':
+                        total_change += row['value_usd']
+                    elif op == 'subtract':
+                        total_change -= row['value_usd']
+                
+                bundled_nav_changes[hash_val] = total_change
+                bundled_indices.update(group.index)
+                is_bundled = True
+                break
+        if is_bundled:
+            continue
+
+        # Rule 1: Zero-impact groups
         is_zero_impact = False
         for group_def in ZERO_NAV_CHANGE_GROUPS:
             if group_def.issubset(tx_types):
@@ -58,7 +87,7 @@ def calculate_nav(df: pd.DataFrame) -> pd.DataFrame:
         if is_zero_impact:
             continue
 
-        # Check for increasing groups
+        # Rule 2: Increasing groups
         is_increasing = False
         for group_def in INCREASING_NAV_CHANGE_GROUPS:
             if group_def.issubset(tx_types):
@@ -68,7 +97,7 @@ def calculate_nav(df: pd.DataFrame) -> pd.DataFrame:
         if is_increasing:
             continue
 
-        # Check for decreasing groups
+        # Rule 3: Decreasing groups
         for group_def in DECREASING_NAV_CHANGE_GROUPS:
             if group_def.issubset(tx_types):
                 decreasing_indices.update(group.index)
@@ -77,8 +106,21 @@ def calculate_nav(df: pd.DataFrame) -> pd.DataFrame:
     # Initialize nav_change column
     df_processed['nav_change'] = 0.0
 
-    # Iterate through the DataFrame to calculate nav_change row by row
+    # Apply bundled changes first
+    for hash_val, change in bundled_nav_changes.items():
+        # Get the first index of the group to assign the net change
+        group_indices = df_processed[df_processed['hash'] == hash_val].index
+        if len(group_indices) > 0:
+            first_index = group_indices[0]
+            df_processed.loc[first_index, 'nav_change'] = change
+            # Other indices in the group will have nav_change = 0 by default
+
+    # Iterate through the DataFrame to calculate nav_change for other rules
     for index, row in df_processed.iterrows():
+        # Skip if already handled by bundled rule
+        if index in bundled_indices:
+            continue
+
         # Rule 1: Zero-impact groups
         if index in zero_impact_indices:
             df_processed.loc[index, 'nav_change'] = 0.0
@@ -100,11 +142,10 @@ def calculate_nav(df: pd.DataFrame) -> pd.DataFrame:
                 df_processed.loc[index, 'nav_change'] = row['value_usd']
             elif is_outgoing and not is_incoming:
                 df_processed.loc[index, 'nav_change'] = -row['value_usd']
-        # For self-transfers or unhandled cases, nav_change remains 0
     
     # Calculate cumulative NAV
     df_processed['nav'] = df_processed['nav_change'].cumsum()
-
+    
     return df_processed
 
 if __name__ == '__main__':
