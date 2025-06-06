@@ -36,17 +36,42 @@ def calculate_nav(df: pd.DataFrame) -> pd.DataFrame:
         {'aave_withdraw', 'credit'},
     ]
     # DECREASING_TX_TYPES = {'from_0x_settler_v1_9'}
-    DECREASING_TX_TYPES = {'debit'}
-    INCREASING_TX_TYPES = {'credit'}
+    DECREASING_NAV_CHANGE_GROUPS = [{'debit'}]
+    INCREASING_NAV_CHANGE_GROUPS = [{'credit'}]
 
-    # Get indices of zero-impact transaction groups
+    # Get indices for all rule groups, ensuring precedence
     zero_impact_indices = set()
+    increasing_indices = set()
+    decreasing_indices = set()
+
     grouped_by_hash = df_processed.groupby('hash')
     for _, group in grouped_by_hash:
         tx_types = set(group['transaction_type'])
+        
+        # Check for zero-impact groups first (highest precedence)
+        is_zero_impact = False
         for group_def in ZERO_NAV_CHANGE_GROUPS:
             if group_def.issubset(tx_types):
                 zero_impact_indices.update(group.index)
+                is_zero_impact = True
+                break
+        if is_zero_impact:
+            continue
+
+        # Check for increasing groups
+        is_increasing = False
+        for group_def in INCREASING_NAV_CHANGE_GROUPS:
+            if group_def.issubset(tx_types):
+                increasing_indices.update(group.index)
+                is_increasing = True
+                break
+        if is_increasing:
+            continue
+
+        # Check for decreasing groups
+        for group_def in DECREASING_NAV_CHANGE_GROUPS:
+            if group_def.issubset(tx_types):
+                decreasing_indices.update(group.index)
                 break
     
     # Initialize nav_change column
@@ -56,27 +81,25 @@ def calculate_nav(df: pd.DataFrame) -> pd.DataFrame:
     for index, row in df_processed.iterrows():
         # Rule 1: Zero-impact groups
         if index in zero_impact_indices:
-            # nav_change remains 0.0
-            continue
-
-        # Rule 2: Increasing tx types
-        if row['transaction_type'] in INCREASING_TX_TYPES:
+            df_processed.loc[index, 'nav_change'] = 0.0
+        
+        # Rule 2: Increasing groups
+        elif index in increasing_indices:
             df_processed.loc[index, 'nav_change'] = abs(row['value_usd'])
-            continue
 
-        # Rule 3: Decreasing tx types
-        if row['transaction_type'] in DECREASING_TX_TYPES:
+        # Rule 3: Decreasing groups
+        elif index in decreasing_indices:
             df_processed.loc[index, 'nav_change'] = -abs(row['value_usd'])
-            continue
 
         # Default rule for all other transactions
-        is_incoming = row['to'] == wallet_address
-        is_outgoing = row['from'] == wallet_address
-        
-        if is_incoming and not is_outgoing:
-            df_processed.loc[index, 'nav_change'] = row['value_usd']
-        elif is_outgoing and not is_incoming:
-            df_processed.loc[index, 'nav_change'] = -row['value_usd']
+        else:
+            is_incoming = row['to'] == wallet_address
+            is_outgoing = row['from'] == wallet_address
+            
+            if is_incoming and not is_outgoing:
+                df_processed.loc[index, 'nav_change'] = row['value_usd']
+            elif is_outgoing and not is_incoming:
+                df_processed.loc[index, 'nav_change'] = -row['value_usd']
         # For self-transfers or unhandled cases, nav_change remains 0
     
     # Calculate cumulative NAV
