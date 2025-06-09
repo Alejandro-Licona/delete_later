@@ -65,11 +65,13 @@ def calculate_nav(csv_path: str):
     for token in df['token'].unique():
         balances[token] = 0.0
 
+    # Pre-calculate event sets for each hash to make loop logic cleaner
+    hash_events = df.groupby('hash')['event_type'].apply(set).to_dict()
 
     balances_history = []
     current_prices = {}
 
-    for _, row in df.iterrows():
+    for index, row in df.iterrows():
         token = row['token']
         event = row['event_type']
         value = row['value']
@@ -80,26 +82,57 @@ def calculate_nav(csv_path: str):
         if row['value'] > 0 and row['value_usd'] > 0:
             current_prices[token] = row['value_usd'] / row['value']
 
-        # Standard credits and debits
-        if event in ['from_treasury_wallet', 'from_swap', 'credit', 'receive_erc20_tokens']:
-            balances[token] += value
-        elif event in ['to_treasury_wallet', 'to_swap', 'debit', 'deposit_into_aave']:
-            balances[token] -= value
+        # --- Balance Calculation Logic ---
+        # This section applies the new balance rules based on event type.
+        # It is structured to handle paired transactions first, then fall back
+        # to standard debit/credit logic for individual transactions.
+        events_in_hash = hash_events.get(tx_hash, set())
 
-        # Aave Supply: Occurs when you send an asset to an Aave pool
-        elif event == 'aave_supply' and from_address == wallet_address:
-            balances[token] -= value 
+        # Group 1 & 2: Paired Aave Transactions
+        if event == 'deposit_into_aave' and 'receive_Atokens' in events_in_hash:
+            pass
+        elif event == 'receive_Atokens' and 'deposit_into_aave' in events_in_hash:
+            if index > 0 and df.loc[index - 1, 'hash'] == tx_hash:
+                deposit_info = df.loc[index - 1]
+                balances[deposit_info['token']] -= deposit_info['value']
+            balances[token] += value 
         
-        # Aave Mint: You receive an aToken after supplying the underlying asset
-        elif event == 'aave_supply' and from_address != wallet_address:
-             balances[token] += value
-        
-        elif event == 'receive_Atokens':
+        elif event == 'burn_Atokens' and 'receive_erc20_tokens' in events_in_hash:
+            pass
+        elif event == 'receive_erc20_tokens' and 'burn_Atokens' in events_in_hash:
+            if index > 0 and df.loc[index - 1, 'hash'] == tx_hash:
+                burn_info = df.loc[index - 1]
+                balances[burn_info['token']] -= burn_info['value']
             balances[token] += value
 
-        # Aave Withdraw: Occurs when you burn aTokens to get the underlying asset back
-        elif event in ['aave_withdraw', 'burn_Atokens']:
-            balances[token] -= value
+        # Group 3: Paired Swap Transactions
+        elif event == 'from_swap' and 'to_swap' in events_in_hash:
+            pass
+        elif event == 'to_swap' and 'from_swap' in events_in_hash:
+            if index > 0 and df.loc[index - 1, 'hash'] == tx_hash:
+                from_info = df.loc[index - 1]
+                balances[from_info['token']] -= from_info['value']
+            balances[token] += value  # Rule 6: Balance of new token increases
+
+        # Default Debit/Credit logic for all other transactions
+        else:
+            # Standard credits (assets coming into the wallet)
+            if event in ['from_treasury_wallet']:
+                balances[token] += value
+            # Standard debits (assets leaving the wallet)
+            elif event in ['to_treasury_wallet']:
+                balances[token] -= value
+            elif event == 'to_swap':
+                pass
+            elif event == 'from_swap':
+                # balances[token] += value
+                pass
+            # Unpaired Aave Supply (asset leaves wallet)
+            elif event == 'aave_supply':
+                pass
+            # Unpaired Aave Withdraw (aToken burned)
+            elif event == 'aave_withdraw':
+                pass
 
         # --- NAV Calculation at each step ---
         nav = 0.0
@@ -126,11 +159,6 @@ def calculate_nav(csv_path: str):
 
     # --- Balances History DataFrame ---
     balances_df = pd.DataFrame(balances_history)
-    
-    final_nav = balances_df['nav'].iloc[-1] if not balances_df.empty else 0.0
-    print("-------------------------------------------------")
-    print(f"Net Asset Value (NAV): ${final_nav:,.2f}")
-    print("-------------------------------------------------")
 
     print("\n--- Balances History ---")
     print(balances_df[['timestamp', 'event_type', 'token', 'value', 'nav']])
@@ -141,23 +169,15 @@ def calculate_nav(csv_path: str):
     columns_to_export = [
         'timestamp',
         'token',
-        # 'wallet',
-        # 'from',
-        # 'token',
         'value',
         'value_usd',
-        # 'transaction_type',
-        # 'aave_event',
         'event_type',
         'nav',
+        'hash',
         'from',
         'to',
-        'hash',
         'token_balances',
-        # 'wallet',
-        # 'from',
-        # 'token',
-        'transaction_type',
+        # 'transaction_type',
         'aave_event',
         'wallet',
     ]
